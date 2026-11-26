@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""
+Home Security Hub (Raspberry Pi side)
+
+Threads:
+  1. serial_loop     - reads Nano messages, auto-reconnects if the cable drops
+  2. heartbeat_loop  - sends HB to the Nano, detects a silent Nano
+  3. alert_worker    - sends email (and optional Telegram) alerts with retries
+  4. Flask (main)    - dashboard + JSON API
+"""
+import os
+import queue
+import smtplib
+import sqlite3
+import threading
+import time
+from email.message import EmailMessage
+
+import requests
+import serial
+from flask import Flask, jsonify
+
+SERIAL_PORT = os.getenv("NANO_PORT", "/dev/serial0")
+BAUD = 9600
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "events.db")
+
+# Optional Telegram
+TG_TOKEN = os.getenv("TG_TOKEN")
+TG_CHAT = os.getenv("TG_CHAT")
+
+# Email (Gmail by default). Use an App Password, never your real password.
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+ALERT_TO = os.getenv("ALERT_TO")
+
+HB_INTERVAL = 2      # seconds between heartbeats sent to the Nano
+NANO_TIMEOUT = 10    # seconds of silence before the Nano is declared offline
+
+ALERTS = {
+    "MOTION": "Motion detected in Away Mode. Door PIN was changed.",
+    "FIRE": "FIRE detected! Water pump activated.",
+    "LOCKOUT": "3 wrong PIN attempts. Keypad locked and alarm sounding.",
+    "NANO_OFFLINE": "Lost contact with the Nano controller (no heartbeat).",
+}
+
+COMMANDS = {"lock": "CMD,LOCK", "away_on": "CMD,AWAY,1", "away_off": "CMD,AWAY,0"}
+
+# ---------- Shared state ----------
+state_lock = threading.Lock()
+state = {"nano_online": False, "last_hb": 0.0, "uptime": 0,
+         "away": 0, "locked": 1, "fire": 0}
+
+ser = None
+ser_lock = threading.Lock()
+
+db_lock = threading.Lock()
+alert_q = queue.Queue()
+
+
+# ---------- Database ----------
+def db(sql, args=()):
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            rows = conn.execute(sql, args).fetchall()
+            conn.commit()
+            return rows
+        finally:
+            conn.close()
+
+
+def init_db():
+    db("""CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            detail TEXT)""")
+
+
+def log_event(kind, detail=""):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    db("INSERT INTO events (ts, kind, detail) VALUES (?, ?, ?)", (ts, kind, detail))
+    print(f"[{ts}] {kind} {detail}", flush=True)
+    if kind in ALERTS:
+        alert_q.put(f"{kind}: {ALERTS[kind]} ({ts})")
+
+
+# ---------- Alerts (email + optional Telegram, with retry) ----------
+def send_email(msg):
+    m = EmailMessage()
+    m["Subject"] = "Home Security Alert: " + msg.split(":")[0]
+    m["From"] = SMTP_USER
+    m["To"] = ALERT_TO
+    m.set_content(msg)
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10) as s:
+        s.login(SMTP_USER, SMTP_PASS)
+        s.send_message(m)
+    return True
+
+
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    return requests.post(url, data={"chat_id": TG_CHAT, "text": msg}, timeout=5).ok
+
+
+def alert_worker():
+    while True:
+        msg = alert_q.get()
+        pending = []
+        if SMTP_USER and SMTP_PASS and ALERT_TO:
+            pending.append(send_email)
+        if TG_TOKEN and TG_CHAT:
+            pending.append(send_telegram)
+        if not pending:
+            log_event("ALERT_SKIPPED", "no alert channel configured")
+            continue
+
+        # Retry each channel separately, up to 3 attempts
+        for attempt in range(3):
+            for send in pending[:]:
+                try:
+                    if send(msg):
+                        pending.remove(send)
+                except (requests.RequestException, smtplib.SMTPException, OSError):
+                    pass
+            if not pending:
+                break
+            time.sleep(2 * (attempt + 1))
+
+        if pending:
+            # The event is already in the database; only the notification failed.
+            log_event("ALERT_FAILED", msg[:80])
+
+
+# ---------- Serial link to the Nano ----------
+def send_to_nano(text):
+    with ser_lock:
+        try:
+            if ser and ser.is_open:
+                ser.write((text + "\n").encode())
+                return True
+        except (serial.SerialException, OSError):
+            pass
+    return False
+
+
+def handle_line(line):
+    parts = line.split(",")
+    if parts[0] == "HB" and len(parts) >= 5:
+        try:
+            up, away, locked, fire = (int(p) for p in parts[1:5])
+        except ValueError:
+            return
+        with state_lock:
+            came_back = not state["nano_online"]
+            state.update(nano_online=True, last_hb=time.time(),
+                         uptime=up, away=away, locked=locked, fire=fire)
+        if came_back:
+            log_event("NANO_ONLINE")
+    elif parts[0] == "EVT" and len(parts) >= 2:
+        log_event(parts[1], ",".join(parts[2:]))
+
+
+def serial_loop():
+    global ser
+    while True:
+        try:
+            with ser_lock:
+                ser = serial.Serial(SERIAL_PORT, BAUD, timeout=1)
+            print(f"Serial open on {SERIAL_PORT}", flush=True)
+            while True:
+                line = ser.readline().decode(errors="ignore").strip()
+                if line:
+                    handle_line(line)
+        except (serial.SerialException, OSError) as e:
+            print(f"Serial problem: {e} - retrying in 3 s", flush=True)
+            with ser_lock:
+                ser = None
+            time.sleep(3)
+
+
+def heartbeat_loop():
+    while True:
+        send_to_nano("HB")
+        with state_lock:
+            stale = time.time() - state["last_hb"] > NANO_TIMEOUT
+            went_offline = stale and state["nano_online"]
+            if went_offline:
+                state["nano_online"] = False
+        if went_offline:
+            log_event("NANO_OFFLINE", f"no heartbeat for {NANO_TIMEOUT} s")
+        time.sleep(HB_INTERVAL)
+
+
+# ---------- Web dashboard ----------
+app = Flask(__name__)
+
+PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Home Security Hub</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:0;padding:16px;background:#f4f5f7;color:#1c1c1e}
+ h1{font-size:20px;margin:0 0 12px}
+ .cards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+ .card{background:#fff;border-radius:8px;padding:10px 14px;min-width:120px;border:1px solid #ddd}
+ .card b{display:block;font-size:12px;color:#666;font-weight:500}
+ .ok{color:#1a7f37}.bad{color:#c62828}
+ button{padding:8px 12px;margin-right:6px;border:1px solid #999;border-radius:6px;background:#fff;cursor:pointer}
+ table{width:100%;border-collapse:collapse;background:#fff;margin-top:12px}
+ th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #eee;font-size:14px}
+ th{background:#fafafa}
+ tr.MOTION td,tr.FIRE td,tr.LOCKOUT td,tr.NANO_OFFLINE td{background:#fdecea}
+</style></head><body>
+<h1>Home Security Hub</h1>
+<div class="cards">
+ <div class="card"><b>Nano controller</b><span id="nano">-</span></div>
+ <div class="card"><b>Away mode</b><span id="away">-</span></div>
+ <div class="card"><b>Door</b><span id="door">-</span></div>
+ <div class="card"><b>Fire</b><span id="fire">-</span></div>
+</div>
+<div>
+ <button onclick="cmd('lock')">Lock door</button>
+ <button onclick="cmd('away_on')">Away ON</button>
+ <button onclick="cmd('away_off')">Away OFF</button>
+</div>
+<table><thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead><tbody id="rows"></tbody></table>
+<script>
+function set(id,text,good){const e=document.getElementById(id);e.textContent=text;e.className=good?'ok':'bad';}
+async function refresh(){
+  try{
+    const s=await (await fetch('/api/status')).json();
+    set('nano',s.nano_online?'Online':'OFFLINE',s.nano_online);
+    set('away',s.away?'ON':'OFF',true);
+    set('door',s.locked?'Locked':'Unlocked',s.locked);
+    set('fire',s.fire?'FIRE':'Clear',!s.fire);
+    const ev=await (await fetch('/api/events')).json();
+    const tb=document.getElementById('rows');tb.replaceChildren();
+    for(const e of ev){
+      const tr=document.createElement('tr');tr.className=e.kind;
+      for(const v of [e.ts,e.kind,e.detail]){const td=document.createElement('td');td.textContent=v||'';tr.appendChild(td);}
+      tb.appendChild(tr);
+    }
+  }catch(err){set('nano','Hub unreachable',false);}
+}
+async function cmd(n){await fetch('/api/cmd/'+n,{method:'POST'});setTimeout(refresh,500);}
+refresh();setInterval(refresh,2000);
+</script></body></html>"""
+
+
+@app.route("/")
+def index():
+    return PAGE
+
+
+@app.route("/api/status")
+def api_status():
+    with state_lock:
+        s = dict(state)
+    s["last_seen_s"] = round(time.time() - s["last_hb"], 1) if s["last_hb"] else None
+    return jsonify(s)
+
+
+@app.route("/api/events")
+def api_events():
+    rows = db("SELECT id, ts, kind, detail FROM events ORDER BY id DESC LIMIT 50")
+    return jsonify([{"id": r[0], "ts": r[1], "kind": r[2], "detail": r[3]} for r in rows])
+
+
+@app.route("/api/cmd/<name>", methods=["POST"])
+def api_cmd(name):
+    if name not in COMMANDS:
+        return jsonify(ok=False, error="unknown command"), 404
+    ok = send_to_nano(COMMANDS[name])
+    log_event("REMOTE_CMD", f"{name} ({'sent' if ok else 'FAILED - no serial link'})")
+    return jsonify(ok=ok)
+
+
+if __name__ == "__main__":
+    init_db()
+    log_event("HUB_START")
+    for target in (serial_loop, heartbeat_loop, alert_worker):
+        threading.Thread(target=target, daemon=True).start()
+    app.run(host="0.0.0.0", port=5000, threaded=True)
